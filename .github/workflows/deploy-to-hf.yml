@@ -1,0 +1,53 @@
+name: Deploy to Hugging Face Space
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install huggingface_hub
+        run: pip install huggingface_hub
+
+      - name: Push to Hugging Face
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_ORG: gcc-insurance-intelligence-lab
+        run: |
+          python - << 'EOF'
+          from huggingface_hub import HfApi
+          import os, pathlib
+
+          api = HfApi(token=os.environ["HF_TOKEN"])
+          repo_type = "space"
+          repo_name = "fraud-triage-sandbox"
+          full_name = f"{os.environ['HF_ORG']}/{repo_name}"
+
+          # create if not exists
+          try:
+              api.create_repo(full_name, repo_type=repo_type, exist_ok=True, space_sdk="gradio")
+          except Exception as e:
+              print("Create repo error:", e)
+
+          # upload all files
+          root = pathlib.Path(".")
+          for path in root.rglob("*"):
+              if path.is_file() and ".git" not in path.parts:
+                  rel = path.as_posix()
+                  api.upload_file(
+                      path_or_fileobj=rel,
+                      path_in_repo=rel,
+                      repo_id=full_name,
+                      repo_type=repo_type
+                  )
+          EOF
