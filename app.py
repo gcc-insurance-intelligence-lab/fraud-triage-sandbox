@@ -1,14 +1,242 @@
 import gradio as gr
-import random
+import os
+import json
+import numpy as np
+from openai import OpenAI
+from huggingface_hub import hf_hub_download
+import joblib
 
-# Fraud detection logic (rule-based for demo)
-def calculate_fraud_likelihood(claim_type, sector, evidence_pct, behavior_pattern, claim_history_count):
-    """Calculate fraud likelihood based on rule-based logic."""
+# ML Model Configuration
+MODEL_REPO = "gcc-insurance-intelligence-lab/fraud-signal-classifier-v1"
+ml_model = None
+feature_encoders = None
+target_encoder = None
+
+def load_ml_model():
+    """Load ML model from local files or Hugging Face Hub"""
+    global ml_model, feature_encoders, target_encoder
     
-    # Initialize anomaly score
+    try:
+        # Try local files first (for development/testing)
+        local_model_dir = "../fraud-signal-classifier-v1"
+        if os.path.exists(f"{local_model_dir}/model.pkl"):
+            print("Loading model from local directory...")
+            ml_model = joblib.load(f"{local_model_dir}/model.pkl")
+            encoders_dict = joblib.load(f"{local_model_dir}/label_encoders.pkl")
+            feature_encoders = encoders_dict['feature_encoders']
+            target_encoder = encoders_dict['target_encoder']
+            print("✓ ML model loaded from local files")
+            return True
+    except Exception as e:
+        print(f"Local model not found: {e}")
+    
+    try:
+        # Download from Hugging Face Hub
+        print(f"Downloading model from HF Hub: {MODEL_REPO}...")
+        model_path = hf_hub_download(repo_id=MODEL_REPO, filename="model.pkl")
+        encoders_path = hf_hub_download(repo_id=MODEL_REPO, filename="label_encoders.pkl")
+        
+        ml_model = joblib.load(model_path)
+        encoders_dict = joblib.load(encoders_path)
+        feature_encoders = encoders_dict['feature_encoders']
+        target_encoder = encoders_dict['target_encoder']
+        print("✓ ML model loaded from Hugging Face Hub")
+        return True
+    except Exception as e:
+        print(f"Error loading ML model from HF Hub: {e}")
+        return False
+
+# Load model at startup
+model_loaded = load_ml_model()
+
+# Initialize OpenAI client
+api_key = os.getenv("OPENAI_API_KEY")
+client = OpenAI(api_key=api_key) if api_key else None
+
+def map_ui_inputs_to_model_features(claim_type, behavior_pattern):
+    """Map UI inputs to model feature values"""
+    claim_type_map = {
+        "Property Damage": "Property Damage",
+        "Theft": "Auto Theft",
+        "Collision": "Auto Collision",
+        "Fire": "Home Fire",
+        "Water Damage": "Home Water Damage",
+        "Total Loss": "Auto Collision",
+        "Liability": "Liability"
+    }
+    
+    behavior_map = {
+        "Normal": "Normal",
+        "Inconsistent statements": "Inconsistent Details",
+        "Rushed filing": "Holiday Filing",
+        "Multiple similar claims": "Multiple Claims",
+        "Suspicious timing": "Suspicious Timing",
+        "Evasive responses": "Suspicious Timing"
+    }
+    
+    policy_type = claim_type_map.get(claim_type, "Property Damage")
+    incident_pattern = behavior_map.get(behavior_pattern, "Normal")
+    
+    return policy_type, incident_pattern
+
+def derive_claimant_risk_from_history(claim_history_count):
+    """Derive risk level from claim history"""
+    if claim_history_count >= 5:
+        return "Very High Risk"
+    elif claim_history_count >= 3:
+        return "High Risk"
+    elif claim_history_count >= 1:
+        return "Medium Risk"
+    else:
+        return "Low Risk"
+
+def analyze_fraud_with_model(claim_type, sector, evidence_pct, behavior_pattern, claim_history_count, claim_description):
+    """Analyze fraud using ML model. Returns (fraud_score, bucket, predicted_class, probabilities, error_msg)"""
+    if not model_loaded or ml_model is None:
+        return None, None, None, None, "ML model not available"
+    
+    try:
+        # Map UI inputs to model features
+        policy_type, incident_pattern = map_ui_inputs_to_model_features(claim_type, behavior_pattern)
+        claimant_profile_risk = derive_claimant_risk_from_history(claim_history_count)
+        
+        # Convert evidence to document consistency score
+        document_consistency_score = evidence_pct / 100.0
+        
+        # Calculate anomaly score based on risk factors
+        anomaly_score = 0.0
+        if evidence_pct < 50:
+            anomaly_score += 0.3
+        if claim_history_count >= 3:
+            anomaly_score += 0.3
+        if behavior_pattern != "Normal":
+            anomaly_score += 0.4
+        anomaly_score = min(anomaly_score, 1.0)
+        
+        # Encode categorical features
+        try:
+            policy_encoded = feature_encoders['policy_type'].transform([policy_type])[0]
+        except:
+            policy_encoded = 0
+        
+        try:
+            risk_encoded = feature_encoders['claimant_profile_risk'].transform([claimant_profile_risk])[0]
+        except:
+            risk_encoded = 0
+        
+        try:
+            pattern_encoded = feature_encoders['incident_pattern'].transform([incident_pattern])[0]
+        except:
+            pattern_encoded = 0
+        
+        # Create feature vector
+        features = np.array([[
+            policy_encoded,
+            risk_encoded,
+            pattern_encoded,
+            document_consistency_score,
+            anomaly_score
+        ]])
+        
+        # Get prediction
+        probabilities = ml_model.predict_proba(features)[0]
+        predicted_idx = np.argmax(probabilities)
+        predicted_class = target_encoder.classes_[predicted_idx]
+        
+        # Calculate fraud score
+        fraud_score_map = {
+            'Clean': 0.0,
+            'Under Review': 0.33,
+            'Flagged': 0.66,
+            'Confirmed Fraud': 1.0
+        }
+        
+        fraud_score = sum(prob * fraud_score_map.get(label, 0.5) 
+                         for prob, label in zip(probabilities, target_encoder.classes_))
+        
+        # Map to bucket
+        if fraud_score < 0.3:
+            bucket = "Low"
+        elif fraud_score < 0.6:
+            bucket = "Medium"
+        else:
+            bucket = "High"
+        
+        # Build probability dict
+        prob_dict = {label: float(prob) for label, prob in zip(target_encoder.classes_, probabilities)}
+        
+        return fraud_score, bucket, predicted_class, prob_dict, None
+        
+    except Exception as e:
+        return None, None, None, None, f"ML prediction error: {str(e)}"
+
+def analyze_fraud_with_ai(claim_type, sector, evidence_pct, behavior_pattern, claim_history_count, claim_description):
+    """Analyze fraud risk using OpenAI GPT-4"""
+    if not client:
+        return {
+            "error": "OpenAI API key not configured.",
+            "fallback": True
+        }
+    
+    system_prompt = """You are an expert insurance fraud analyst with 20+ years of experience in the GCC region.
+Your role is to provide detailed fraud risk assessments for insurance claims.
+
+IMPORTANT GUIDELINES:
+- You provide ADVISORY analysis only - never make final fraud determinations
+- All outputs must emphasize human review is mandatory
+- Focus on explainability and transparency
+- Never accuse anyone of fraud - only identify risk factors
+
+Output your analysis as a JSON object with this structure:
+{
+    "anomaly_score": <float 0-1>,
+    "fraud_likelihood": "<Low|Medium|High>",
+    "uncertainty_score": <float 0-1>,
+    "risk_factors": [<list of identified risk factors>],
+    "protective_factors": [<list of factors that reduce risk>],
+    "investigation_recommendations": [<list of recommended actions>],
+    "explanation": "<detailed explanation>",
+    "confidence_level": "<Low|Medium|High>",
+    "requires_immediate_escalation": <boolean>
+}"""
+    
+    user_prompt = f"""Analyze this insurance claim for fraud risk:
+
+**Claim Details:**
+- Claim Type: {claim_type}
+- Sector: {sector}
+- Evidence Provided: {evidence_pct}%
+- Behavior Pattern: {behavior_pattern}
+- Claim History Count: {claim_history_count} previous claims
+- Claim Description: {claim_description}
+
+Provide a comprehensive fraud risk assessment following the JSON structure specified."""
+    
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.3,
+            response_format={"type": "json_object"}
+        )
+        
+        analysis = json.loads(response.choices[0].message.content)
+        analysis["fallback"] = False
+        return analysis
+        
+    except Exception as e:
+        return {
+            "error": f"AI analysis failed: {str(e)}",
+            "fallback": True
+        }
+
+def calculate_fraud_likelihood(claim_type, sector, evidence_pct, behavior_pattern, claim_history_count):
+    """Calculate fraud likelihood based on rule-based logic"""
     anomaly_score = 0.0
     
-    # Evidence percentage factor (lower evidence = higher risk)
     if evidence_pct < 30:
         anomaly_score += 0.35
     elif evidence_pct < 50:
@@ -16,7 +244,6 @@ def calculate_fraud_likelihood(claim_type, sector, evidence_pct, behavior_patter
     elif evidence_pct < 70:
         anomaly_score += 0.10
     
-    # Behavior pattern factor
     if behavior_pattern == "Inconsistent statements":
         anomaly_score += 0.25
     elif behavior_pattern == "Rushed filing":
@@ -26,7 +253,6 @@ def calculate_fraud_likelihood(claim_type, sector, evidence_pct, behavior_patter
     elif behavior_pattern == "Suspicious timing":
         anomaly_score += 0.15
     
-    # Claim history factor
     if claim_history_count >= 5:
         anomaly_score += 0.25
     elif claim_history_count >= 3:
@@ -34,22 +260,18 @@ def calculate_fraud_likelihood(claim_type, sector, evidence_pct, behavior_patter
     elif claim_history_count >= 2:
         anomaly_score += 0.08
     
-    # Claim type factor
     high_risk_types = ["Theft", "Total Loss", "Fire"]
     if claim_type in high_risk_types:
         anomaly_score += 0.15
     
-    # Sector factor
     if sector == "Commercial":
-        anomaly_score += 0.05  # Slightly higher complexity
+        anomaly_score += 0.05
     
-    # Cap at 1.0
     anomaly_score = min(anomaly_score, 1.0)
-    
     return anomaly_score
 
 def get_fraud_bucket(anomaly_score):
-    """Classify fraud likelihood into buckets."""
+    """Classify fraud likelihood into buckets"""
     if anomaly_score >= 0.65:
         return "High"
     elif anomaly_score >= 0.35:
@@ -58,10 +280,9 @@ def get_fraud_bucket(anomaly_score):
         return "Low"
 
 def calculate_uncertainty(evidence_pct, claim_history_count):
-    """Calculate uncertainty score based on available information."""
+    """Calculate uncertainty score"""
     uncertainty = 0.0
     
-    # Low evidence increases uncertainty
     if evidence_pct < 40:
         uncertainty += 0.40
     elif evidence_pct < 60:
@@ -69,7 +290,6 @@ def calculate_uncertainty(evidence_pct, claim_history_count):
     elif evidence_pct < 80:
         uncertainty += 0.15
     
-    # Limited claim history increases uncertainty
     if claim_history_count == 0:
         uncertainty += 0.30
     elif claim_history_count == 1:
@@ -77,135 +297,219 @@ def calculate_uncertainty(evidence_pct, claim_history_count):
     
     return min(uncertainty, 1.0)
 
-def generate_explanation(claim_type, sector, evidence_pct, behavior_pattern, claim_history_count, anomaly_score, bucket):
-    """Generate detailed explanation of the fraud assessment."""
-    
-    explanation = f"### Fraud Triage Assessment\n\n"
-    explanation += f"**Claim Type:** {claim_type}\n"
-    explanation += f"**Sector:** {sector}\n"
-    explanation += f"**Evidence Provided:** {evidence_pct}%\n"
-    explanation += f"**Behavior Pattern:** {behavior_pattern}\n"
-    explanation += f"**Claim History Count:** {claim_history_count}\n\n"
-    
-    explanation += f"---\n\n"
-    explanation += f"**Anomaly Score:** {anomaly_score:.2f} / 1.00\n"
-    explanation += f"**Fraud Likelihood Bucket:** {bucket}\n\n"
-    
-    explanation += f"#### Risk Factors Identified:\n\n"
-    
-    factors = []
-    
-    if evidence_pct < 50:
-        factors.append(f"⚠️ Low evidence documentation ({evidence_pct}%)")
-    
-    if behavior_pattern in ["Inconsistent statements", "Multiple similar claims", "Suspicious timing"]:
-        factors.append(f"⚠️ Concerning behavior pattern: {behavior_pattern}")
-    
-    if claim_history_count >= 3:
-        factors.append(f"⚠️ High claim frequency ({claim_history_count} prior claims)")
-    
-    if claim_type in ["Theft", "Total Loss", "Fire"]:
-        factors.append(f"⚠️ High-risk claim type: {claim_type}")
-    
-    if factors:
-        for factor in factors:
-            explanation += f"- {factor}\n"
-    else:
-        explanation += "- ✅ No significant risk factors detected\n"
-    
-    return explanation
-
-def generate_human_review_warning(bucket, uncertainty):
-    """Generate human review warning based on bucket and uncertainty."""
-    
-    warning = "\n---\n\n### ⚠️ Human Review Required\n\n"
-    
-    if bucket == "High":
-        warning += "**CRITICAL:** This claim has been flagged as HIGH RISK for potential fraud. "
-        warning += "Immediate human investigation is required before any processing decisions are made.\n\n"
-        warning += "**Recommended Actions:**\n"
-        warning += "- Assign to fraud investigation team\n"
-        warning += "- Request additional documentation\n"
-        warning += "- Conduct claimant interview\n"
-        warning += "- Verify all evidence independently\n"
-    elif bucket == "Medium":
-        warning += "**CAUTION:** This claim shows moderate fraud indicators. "
-        warning += "Enhanced review and verification are required.\n\n"
-        warning += "**Recommended Actions:**\n"
-        warning += "- Request additional supporting documentation\n"
-        warning += "- Verify claimant information\n"
-        warning += "- Review claim history in detail\n"
-        warning += "- Consider field investigation if warranted\n"
-    else:
-        warning += "**STANDARD:** This claim shows low fraud indicators, but human review is still required. "
-        warning += "Follow standard claims processing procedures.\n\n"
-        warning += "**Recommended Actions:**\n"
-        warning += "- Standard documentation review\n"
-        warning += "- Verify basic claim information\n"
-        warning += "- Process according to normal workflow\n"
-    
-    if uncertainty > 0.5:
-        warning += "\n⚠️ **HIGH UNCERTAINTY:** Limited information available. Additional data collection strongly recommended.\n"
-    
-    warning += "\n---\n\n"
-    warning += "**IMPORTANT:** This is an advisory tool only. All fraud determinations must be made by qualified human investigators. "
-    warning += "No automated system should make final decisions on fraud accusations or claim denials."
-    
-    return warning
-
-def analyze_fraud_risk(claim_type, sector, evidence_pct, behavior_pattern, claim_history_count):
-    """Main function to analyze fraud risk."""
-    
-    # Calculate anomaly score and fraud likelihood
+def calculate_fraud_likelihood_fallback(claim_type, sector, evidence_pct, behavior_pattern, claim_history_count):
+    """Fallback rule-based fraud detection"""
     anomaly_score = calculate_fraud_likelihood(claim_type, sector, evidence_pct, behavior_pattern, claim_history_count)
-    
-    # Get fraud bucket
     bucket = get_fraud_bucket(anomaly_score)
-    
-    # Calculate uncertainty
     uncertainty = calculate_uncertainty(evidence_pct, claim_history_count)
     
-    # Generate explanation
-    explanation = generate_explanation(claim_type, sector, evidence_pct, behavior_pattern, claim_history_count, anomaly_score, bucket)
+    return {
+        "anomaly_score": anomaly_score,
+        "fraud_likelihood": bucket,
+        "uncertainty_score": uncertainty,
+        "fallback": True
+    }
+
+def format_analysis_output(analysis, claim_type, sector, evidence_pct, behavior_pattern, claim_history_count, 
+                          ml_score, ml_bucket, ml_class, ml_probs):
+    """Format analysis with hybrid ML + rule-based results"""
     
-    # Generate human review warning
-    warning = generate_human_review_warning(bucket, uncertainty)
+    if analysis.get("fallback"):
+        mode = "⚙️ Rule-Based Mode (AI Unavailable)"
+        if "error" in analysis:
+            error_msg = f"\n\n⚠️ **Note:** {analysis['error']}\n\nFalling back to rule-based analysis.\n"
+        else:
+            error_msg = ""
+    else:
+        mode = "🤖 AI-Powered Analysis"
+        error_msg = ""
     
-    # Combine outputs
-    full_output = explanation + warning
+    ml_available = ml_score is not None
+    
+    if ml_available:
+        mode = "🔬 Hybrid Mode: AI + ML Model"
+    
+    output = f"# {mode}\n{error_msg}\n"
+    output += f"## Fraud Triage Assessment\n\n"
+    output += f"**Claim Type:** {claim_type}\n"
+    output += f"**Sector:** {sector}\n"
+    output += f"**Evidence Provided:** {evidence_pct}%\n"
+    output += f"**Behavior Pattern:** {behavior_pattern}\n"
+    output += f"**Claim History Count:** {claim_history_count}\n\n"
+    output += f"---\n\n"
+    
+    # Rule-based metrics
+    output += f"### 📊 Risk Metrics (Rule-Based)\n\n"
+    output += f"- **Anomaly Score:** {analysis['anomaly_score']:.2f} / 1.00\n"
+    output += f"- **Fraud Likelihood:** {analysis['fraud_likelihood']}\n"
+    output += f"- **Uncertainty Score:** {analysis.get('uncertainty_score', 0):.2f} / 1.00\n"
+    
+    if not analysis.get("fallback"):
+        output += f"- **Confidence Level:** {analysis.get('confidence_level', 'N/A')}\n"
+        output += f"- **Immediate Escalation Required:** {'Yes' if analysis.get('requires_immediate_escalation') else 'No'}\n"
+    
+    # ML model metrics
+    if ml_available:
+        output += f"\n### 🤖 ML Model Metrics\n\n"
+        output += f"- **ML Fraud Score:** {ml_score:.3f} / 1.00\n"
+        output += f"- **ML Bucket:** {ml_bucket}\n"
+        output += f"- **ML Predicted Class:** {ml_class}\n"
+        
+        if ml_probs:
+            output += f"\n**Class Probabilities:**\n"
+            for label, prob in ml_probs.items():
+                output += f"  - {label}: {prob:.3f}\n"
+        
+        # Hybrid decision
+        rule_bucket = analysis['fraud_likelihood']
+        output += f"\n### ⚖️ Hybrid Decision\n\n"
+        output += f"- **Rule-Based Bucket:** {rule_bucket}\n"
+        output += f"- **ML Model Bucket:** {ml_bucket}\n"
+        
+        bucket_priority = {'Low': 1, 'Medium': 2, 'High': 3}
+        if bucket_priority.get(ml_bucket, 0) > bucket_priority.get(rule_bucket, 0):
+            final_bucket = ml_bucket
+            escalation = True
+            output += f"- **Final Bucket:** {final_bucket} ⬆️ (Escalated by ML model)\n"
+        elif bucket_priority.get(rule_bucket, 0) > bucket_priority.get(ml_bucket, 0):
+            final_bucket = rule_bucket
+            escalation = True
+            output += f"- **Final Bucket:** {final_bucket} ⬆️ (Escalated by rules)\n"
+        else:
+            final_bucket = rule_bucket
+            escalation = False
+            output += f"- **Final Bucket:** {final_bucket} ✓ (Agreement)\n"
+        
+        if escalation:
+            output += f"\n⚠️ **Disagreement Detected:** ML and rule-based systems produced different risk levels. Taking higher severity for safety.\n"
+    
+    output += f"\n---\n\n"
+    
+    # Risk factors
+    if not analysis.get("fallback") and "risk_factors" in analysis:
+        output += f"### ⚠️ Risk Factors Identified\n\n"
+        for factor in analysis["risk_factors"]:
+            output += f"- {factor}\n"
+        output += f"\n"
+    
+    # Protective factors
+    if not analysis.get("fallback") and "protective_factors" in analysis:
+        output += f"### ✅ Protective Factors\n\n"
+        for factor in analysis["protective_factors"]:
+            output += f"- {factor}\n"
+        output += f"\n"
+    
+    # Explanation
+    if not analysis.get("fallback") and "explanation" in analysis:
+        output += f"### 📝 Detailed Explanation\n\n"
+        output += f"{analysis['explanation']}\n\n"
+    
+    # Investigation recommendations
+    if not analysis.get("fallback") and "investigation_recommendations" in analysis:
+        output += f"### 🔍 Investigation Recommendations\n\n"
+        for i, rec in enumerate(analysis["investigation_recommendations"], 1):
+            output += f"{i}. {rec}\n"
+        output += f"\n"
+    
+    # Human review warning
+    output += f"---\n\n"
+    output += f"### ⚠️ MANDATORY HUMAN REVIEW\n\n"
+    
+    bucket = final_bucket if ml_available and 'final_bucket' in locals() else analysis["fraud_likelihood"]
+    if bucket == "High":
+        output += "**CRITICAL:** This claim has been flagged as HIGH RISK for potential fraud. "
+        output += "Immediate human investigation is required before any processing decisions are made.\n\n"
+    elif bucket == "Medium":
+        output += "**CAUTION:** This claim shows moderate fraud indicators. "
+        output += "Enhanced review and verification are required.\n\n"
+    else:
+        output += "**STANDARD:** This claim shows low fraud indicators, but human review is still required. "
+        output += "Follow standard claims processing procedures.\n\n"
+    
+    output += "**IMPORTANT:** This is an advisory tool only. All fraud determinations must be made by qualified human investigators. "
+    output += "No automated system should make final decisions on fraud accusations or claim denials.\n\n"
+    
+    output += "**Governance:** This analysis is logged for audit purposes and must be reviewed by a licensed fraud investigator before any action is taken."
+    
+    return output
+
+def analyze_fraud_risk(claim_type, sector, evidence_pct, behavior_pattern, claim_history_count, claim_description):
+    """Main function to analyze fraud risk with AI, ML model, and rule-based fallback"""
+    
+    # Get ML model prediction
+    ml_score, ml_bucket, ml_class, ml_probs, ml_error = analyze_fraud_with_model(
+        claim_type, sector, evidence_pct, behavior_pattern, claim_history_count, claim_description
+    )
+    
+    # Try AI analysis
+    analysis = analyze_fraud_with_ai(claim_type, sector, evidence_pct, behavior_pattern, claim_history_count, claim_description)
+    
+    # If AI fails, use fallback
+    if analysis.get("fallback") and "error" in analysis:
+        fallback_analysis = calculate_fraud_likelihood_fallback(claim_type, sector, evidence_pct, behavior_pattern, claim_history_count)
+        fallback_analysis["error"] = analysis["error"]
+        analysis = fallback_analysis
+    
+    # Format output with ML results
+    detailed_output = format_analysis_output(
+        analysis, claim_type, sector, evidence_pct, behavior_pattern, claim_history_count,
+        ml_score, ml_bucket, ml_class, ml_probs
+    )
     
     # Create summary
-    summary = f"""
-**Fraud Likelihood:** {bucket}
-**Anomaly Score:** {anomaly_score:.2f}
-**Uncertainty Score:** {uncertainty:.2f}
-**Human Review:** Required
-    """
+    rule_bucket = analysis['fraud_likelihood']
     
-    return full_output, summary, anomaly_score, uncertainty
+    summary = f"""**Fraud Likelihood (Rules):** {rule_bucket}
+**Anomaly Score:** {analysis['anomaly_score']:.2f}
+**Uncertainty Score:** {analysis.get('uncertainty_score', 0):.2f}"""
+    
+    if ml_score is not None:
+        summary += f"\n**ML Fraud Score:** {ml_score:.3f}"
+        summary += f"\n**ML Bucket:** {ml_bucket}"
+        summary += f"\n**ML Predicted Class:** {ml_class}"
+        
+        bucket_priority = {'Low': 1, 'Medium': 2, 'High': 3}
+        if bucket_priority.get(ml_bucket, 0) != bucket_priority.get(rule_bucket, 0):
+            final_bucket = ml_bucket if bucket_priority.get(ml_bucket, 0) > bucket_priority.get(rule_bucket, 0) else rule_bucket
+            summary += f"\n**Final Bucket:** {final_bucket} (Escalated)"
+        else:
+            summary += f"\n**Final Bucket:** {rule_bucket} (Agreement)"
+    else:
+        summary += f"\n**ML Model:** {ml_error if ml_error else 'Not available'}"
+    
+    summary += f"\n**Human Review:** Required"
+    summary += f"\n**Mode:** {'Hybrid (AI + ML)' if ml_score and not analysis.get('fallback') else 'AI-Powered' if not analysis.get('fallback') else 'Rule-Based'}"
+    
+    return detailed_output, summary, analysis['anomaly_score'], analysis.get('uncertainty_score', 0)
 
 # Create Gradio interface
-with gr.Blocks(title="Fraud Triage Sandbox", theme=gr.themes.Soft()) as demo:
+with gr.Blocks(title="Fraud Triage Sandbox - Hybrid Edition", theme=gr.themes.Soft()) as demo:
     gr.Markdown("""
-    # 🔍 Fraud Triage Sandbox
+    # 🔍 Fraud Triage Sandbox - Hybrid Edition
     
-    **Rule-Based Fraud Detection System for Insurance Claims**
+    **Hybrid Fraud Detection: AI + ML Model + Rule-Based Logic**
     
-    This tool demonstrates a rule-based fraud triage system for insurance claims. 
-    Enter claim details to receive a fraud risk assessment and triage recommendation.
+    This tool combines:
+    - 🤖 OpenAI GPT-4 for intelligent fraud analysis
+    - 🔬 ML Model (fraud-signal-classifier-v1) for pattern detection
+    - ⚙️ Rule-based logic for baseline assessment
     
     ## ⚠️ MANDATORY DISCLAIMER
     
     **This is a demonstration tool for educational purposes only.**
     
     - ✅ All outputs are **advisory only** and require human verification
-    - ✅ No AI component issues approvals, denials, or financial outcomes
+    - ✅ No AI/ML component issues approvals, denials, or financial outcomes
     - ✅ All fraud determinations must be made by qualified human investigators
-    - ✅ This tool uses **rule-based logic only** - not machine learning
-    - ✅ No real insurance company data or proprietary rules are used
+    - ✅ Hybrid mode combines multiple signals for enhanced detection
     - ✅ Not for use in actual claim approval, pricing, or reserving decisions
     
     **Human-in-the-loop is mandatory for all fraud investigations.**
+    
+    ## 🔐 Configuration
+    
+    To enable AI analysis, set the `OPENAI_API_KEY` environment variable or Hugging Face Secret.
+    ML model is loaded automatically from Hugging Face Hub.
     """
     )
     
@@ -249,6 +553,13 @@ with gr.Blocks(title="Fraud Triage Sandbox", theme=gr.themes.Soft()) as demo:
                 info="Number of previous claims filed"
             )
             
+            claim_description = gr.Textbox(
+                label="Claim Description",
+                placeholder="Describe the claim incident in detail...",
+                lines=5,
+                value="Vehicle collision at intersection. Driver claims other party ran red light. Minor damage to front bumper and headlight."
+            )
+            
             analyze_btn = gr.Button("🔍 Analyze Fraud Risk", variant="primary", size="lg")
         
         with gr.Column():
@@ -256,7 +567,7 @@ with gr.Blocks(title="Fraud Triage Sandbox", theme=gr.themes.Soft()) as demo:
             
             summary_output = gr.Textbox(
                 label="Quick Summary",
-                lines=5,
+                lines=8,
                 interactive=False
             )
             
@@ -275,7 +586,7 @@ with gr.Blocks(title="Fraud Triage Sandbox", theme=gr.themes.Soft()) as demo:
     
     analyze_btn.click(
         fn=analyze_fraud_risk,
-        inputs=[claim_type, sector, evidence_pct, behavior_pattern, claim_history_count],
+        inputs=[claim_type, sector, evidence_pct, behavior_pattern, claim_history_count, claim_description],
         outputs=[detailed_output, summary_output, anomaly_output, uncertainty_output]
     )
     
@@ -283,49 +594,43 @@ with gr.Blocks(title="Fraud Triage Sandbox", theme=gr.themes.Soft()) as demo:
         gr.Markdown("""
         ## How It Works
         
-        This fraud triage system uses **configurable business rules** to assess fraud risk. It does NOT use machine learning models.
+        This fraud triage system uses **Hybrid Detection** combining three approaches:
         
-        ### Risk Factors Evaluated:
+        ### 1. AI Analysis (OpenAI GPT-4)
+        - Natural language understanding of claim descriptions
+        - Contextual risk factor identification
+        - Investigation recommendations
         
-        1. **Evidence Percentage**: Lower documentation completeness increases risk
-        2. **Behavior Pattern**: Suspicious behaviors (inconsistent statements, rushed filing, etc.) raise flags
-        3. **Claim History**: Multiple previous claims increase scrutiny
-        4. **Claim Type**: Certain claim types (theft, total loss, fire) carry higher inherent risk
-        5. **Sector**: Commercial claims may have different risk profiles
+        ### 2. ML Model (fraud-signal-classifier-v1)
+        - Trained on synthetic insurance fraud data
+        - Pattern recognition across multiple features
+        - Probability-based risk scoring
+        - Bucket classification (Low/Medium/High)
         
-        ### Fraud Likelihood Buckets:
+        ### 3. Rule-Based Logic
+        - Evidence completeness assessment
+        - Behavior pattern evaluation
+        - Claim history analysis
+        - Baseline fraud indicators
         
-        - **Low (0.0 - 0.34)**: Standard processing with normal verification
-        - **Medium (0.35 - 0.64)**: Enhanced review and additional documentation required
-        - **High (0.65 - 1.0)**: Immediate escalation to fraud investigation team
+        ### Hybrid Decision Logic
+        - Combines all three signals
+        - Takes higher severity when systems disagree
+        - Flags disagreements for human review
+        - Provides comprehensive risk assessment
         
-        ### Uncertainty Score:
+        ### Fraud Likelihood Buckets
+        - **Low (0.0 - 0.34)**: Standard processing
+        - **Medium (0.35 - 0.64)**: Enhanced review
+        - **High (0.65 - 1.0)**: Immediate investigation
         
-        Indicates confidence in the assessment based on available information. Higher uncertainty suggests more data is needed.
+        ### Use Cases
+        - Training and education
+        - Workflow prototyping
+        - AI/ML demonstration
+        - Fraud detection research
         
-        ### Educational Purposes:
-        
-        - **Prototyping**: Test fraud detection workflows
-        - **Training**: Teach insurance fraud concepts
-        - **Demonstration**: Showcase rule-based triage systems
-        - **Testing**: Validate fraud detection logic
-        
-        ### Compliance & Safety:
-        
-        - ✅ No real insurer names or proprietary information
-        - ✅ No actuarial formulas or pricing models
-        - ✅ No KYC or sensitive personal fields
-        - ✅ All outputs marked as advisory only
-        - ✅ Human-in-the-loop enforced
-        
-        ### Limitations:
-        
-        - Simplified rule-based logic (real systems use ML + human expertise)
-        - No integration with actual claims databases
-        - No real-time fraud network analysis
-        - Educational demonstration only
-        
-        **Built by Qoder for Vercept**
+        **Built for GCC Insurance Intelligence Lab**
         """
         )
 
