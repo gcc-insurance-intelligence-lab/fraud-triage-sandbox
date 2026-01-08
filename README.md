@@ -66,6 +66,14 @@ The system intelligently combines all three approaches:
 - **Escalation**: Automatic escalation when uncertainty is detected
 - **Fallback**: If AI or ML fails, rule-based system ensures continuity
 
+## ⚡ ZeroGPU Ready
+
+This Space is **ZeroGPU-ready** and will automatically utilize GPU acceleration when available:
+- Code decorated with `@spaces.GPU` for optimal performance
+- Seamless fallback to CPU when GPU unavailable
+- No code changes needed when GPU is enabled
+- **Note**: ZeroGPU requires HuggingFace Team or Enterprise subscription
+
 ## Features
 
 - **Interactive Claim Input**: Enter claim type, sector, evidence percentage, behavior pattern, and claim history

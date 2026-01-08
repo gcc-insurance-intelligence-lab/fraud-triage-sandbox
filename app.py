@@ -5,6 +5,7 @@ import numpy as np
 from openai import OpenAI
 from huggingface_hub import hf_hub_download
 import joblib
+import spaces
 
 # ML Model Configuration
 MODEL_REPO = "gcc-insurance-intelligence-lab/fraud-signal-classifier-v1"
@@ -433,6 +434,7 @@ def format_analysis_output(analysis, claim_type, sector, evidence_pct, behavior_
     
     return output
 
+@spaces.GPU(duration=60)
 def analyze_fraud_risk(claim_type, sector, evidence_pct, behavior_pattern, claim_history_count, claim_description):
     """Main function to analyze fraud risk with AI, ML model, and rule-based fallback"""
     
